@@ -11,7 +11,6 @@ git clone <this-repo-url>
 cd "<this-repo-folder>"
 ```
 
-This repository is also archived on OSF: *TODO — add the OSF project link here once published.* The two are kept in sync with identical contents; use whichever is more convenient (`git clone` here for the latest version and version history, or download directly from OSF for a one-off copy without needing git).
 
 ## Repository structure
 
