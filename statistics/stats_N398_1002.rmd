@@ -1,0 +1,4834 @@
+---
+title: "stas_N398"
+author: "chchch"
+date: "2025-09-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(readr)
+library(tidyverse)
+library(ggplot2)
+library(stringr)
+library(gridExtra)
+library(ggpattern)
+library(openxlsx)
+library(ggpubr)
+library(lme4)
+library(ggsignif)
+library(glmmTMB)
+library(ggeffects)
+library(mediation)
+library(vcd)
+
+check_overdispersion <- function(model) {
+  rdf <- df.residual(model)
+  rp <- residuals(model, type = "pearson")
+  dispersion <- sum(rp^2) / rdf
+  return(dispersion)
+}
+
+extract_lmer_coefs <- function(model) {
+  coefs <- data.frame(coef(summary(model)))
+  coefs <- coefs %>%
+    mutate(
+      Estimate = round(Estimate, 5),
+      Std..Error = round(Std..Error, 5),
+      t.value = round(t.value, 4),
+      p.z = ifelse(
+        2 * (1 - pnorm(abs(t.value))) < 0.001, "<.001",
+        ifelse(
+          2 * (1 - pnorm(abs(t.value))) < 0.01, "<.01",
+          ifelse(
+            2 * (1 - pnorm(abs(t.value))) < 0.05, "<.05",
+            round(2 * (1 - pnorm(abs(t.value))), 4)
+          )
+        )
+      )
+    )
+  return(coefs)
+}
+```
+
+=================================================================================
+
+### Data pre-processing: N=398
+```{r message=FALSE, warning=FALSE}
+# All inputs used below (except the 3 explicitly marked "not required") are
+# shipped in this repository under dataset/. See README.md for the full
+# pipeline and for how each file is produced upstream.
+
+audio <- read_csv("../dataset/audio_cluster_54_k5_v1.csv",
+                      locale = locale(encoding = "utf8"))
+
+audio1 <- audio %>%
+  dplyr::select(keycode, kmeans_cluster) %>%
+  rename(cluster_a = kmeans_cluster)
+
+audio_raw <- read_csv("../dataset/features_raw_251001.csv")
+audio_raw1 <- audio_raw %>%
+  dplyr::select(keycode, mean_f0, std_f0, VUV, speaking_rate_w, MFCC0, F1, F2,
+                falling_ratio, rising_ratio, `rising-falling_ratio`, `falling-rising_ratio`,
+                arousal, valence, std_arousal, std_valence)
+
+visual <- read_csv("../dataset/visual_cluster_54_k6_v1.csv",
+                   locale = locale(encoding = "utf8"))
+visual1 <- visual %>%
+  dplyr::select(kmeans_cluster, keycode) %>%
+  rename(cluster_v = kmeans_cluster)
+
+text <- read_csv("../dataset/text_cluster_33_k4_v_auto.csv")
+text1 <- text %>%
+  dplyr::select(keycode, kmeans_cluster,
+                Analytic, Clout, Authentic, affiliation, achieve, power, emo_pos,
+                emo_anx, emo_anger, emo_sad, swear, prosocial, polite, conflict,
+                we, they, moral, risk, motion) %>%
+  rename(cluster_t = kmeans_cluster)
+
+# Base table combined1/combined2 below are built from
+# (party/state/name/win/gender/...).
+combined <- read_csv("../dataset/visual_audio_cluster_54_k5_v1.csv",
+                    locale = locale(encoding = "utf8"))
+
+# Third-party NYTimes polling data -- check licensing before redistributing
+# this file further if you did not already confirm you may do so.
+poll <- read_csv("../dataset/Poll_NYTimes_241001-241104_v2.csv",
+                    locale = locale(encoding = "utf8"))
+
+poll1 <- poll %>%
+  group_by(state, date) %>%
+  mutate(poll_norm = poll/sum(poll))
+
+issue <- read_csv("../dataset/word_data_398.csv",
+                      locale = locale(encoding = "utf8"))
+issue1 <- issue %>%
+  dplyr::select(keycode, topic)
+
+# NOT included in this repository, but also NOT required to reproduce `data`
+# below: the inner_join(length1, ...) a few chunks down is commented out, so
+# length1 is currently dead code. Safe to skip unless you re-enable that join.
+length <- read_csv("video_length_N585.csv",
+                      locale = locale(encoding = "utf8"))
+length1 <- length %>%
+  mutate(
+    video_len = as.character(video_len),  # ensure character
+    length_sec = sapply(strsplit(video_len, ":"), function(x) {
+      parts <- as.numeric(x)
+      if (length(parts) == 3) {
+        parts[1]*3600 + parts[2]*60 + parts[3]
+      } else if (length(parts) == 2) {
+        parts[1]*60 + parts[2]
+      } else {
+        as.numeric(parts)
+      }
+    }))
+
+sentiment <- read_csv("../dataset/ig_video_N398_post,comment,whisper_cluster_sentiment_statistics(before0109)_0716_v3.csv")
+sentiment1 <- sentiment %>%
+  dplyr::select(-caption) %>%
+  dplyr::select(comment_count, comment_score_pos, comment_score_neg, comment_score_neu, keycode)
+
+# NOT included in this repository, but also NOT required to reproduce `data`
+# below: all_comments is read but never referenced again after this point.
+all_comments <- read_csv("ig_video_N583_comments_bert_TimeLMs_sentiment_results_250716_updated.csv")
+
+
+pop <- read_csv("../dataset/combined_241001-241104_N398_caption_post_populism.csv",
+                locale = locale(encoding = "big5"))
+
+pop1 <- pop %>%
+  dplyr::select(-text, -date, -name, -state, -party) %>%
+  mutate(text_pop = ifelse(text_num_matched_roots == 0, 0, 1)) %>%
+  mutate(caption_pop = ifelse(caption_num_matched_roots == 0, 0, 1)) %>%
+  dplyr::select(text_pop, caption_pop, keycode)
+
+populism <- read_csv("../dataset/labeled_populism_v38_N398.csv")
+
+populism1 <- populism %>%
+  mutate(people_centrism = ifelse(centr > 0.5, 1, 0)) %>%
+  mutate(anti_elitism = ifelse(elite > 0.5, 1, 0)) %>%
+  mutate(left_wing = ifelse(left > 0.5, 1, 0)) %>%
+  mutate(right_wing = ifelse(right > 0.5, 1, 0)) %>%
+  mutate(party_b = ifelse(party == "Republican", 1, 0)) %>%
+  dplyr::select(people_centrism, anti_elitism, left_wing, right_wing, elite, centr, left, right, keycode) %>%
+  mutate(popp = ifelse(people_centrism == 1 & anti_elitism == 1, "both",
+                       ifelse(people_centrism == 0 & anti_elitism == 1, "elite",
+                              ifelse(people_centrism == 1 & anti_elitism == 0, "centr",
+                                     "none")))) %>%
+  mutate(popornot = ifelse(popp == "none", 0, 1))
+  #dplyr::select(elite, centr, left, right, keycode)
+
+# NOT included in this repository, but also NOT required to reproduce `data`
+# below: the inner_join(objects1, ...) a few chunks down is commented out, so
+# objects1 is currently dead code. Safe to skip unless you re-enable that join.
+objects <- read_csv("ig_videos_20240901-20241104_N583_yolov11_Objects365_counts.csv")
+non_object_cols <- c("keycode", "max_frame")
+objects1 <- objects %>%
+  dplyr::select(-video_name) %>%
+  mutate(across(
+    .cols = -all_of(non_object_cols),
+    .fns = ~ .x / max_frame,
+    .names = "{.col}"
+  ))
+
+# Note: dataset/ also has ig_video_visualValid_N584_0901-1104_zscoreEngagement_0328.csv,
+# a different snapshot (different N and calibration date) of the same
+# underlying table -- this is the correct/matching one for this analysis.
+engagement <- read_csv("../dataset/ig_video_visualValid_N583_0901-1104_zscoreEngagement_250909.csv")
+engagement1 <- engagement %>%
+  dplyr::select(`7days_followers`, `7days_followers_zscore`, post_date, follower_date,
+                post_likes_zscore, post_comments_zscore,
+                engagement_rate, engagement_rate_zscore, likes_by_follower, comments_by_follower, 
+                likes_by_follower_zscore, comments_by_follower_zscore, keycode) 
+
+# combined data
+combined1 <- combined %>%
+  dplyr::select(-issue_label, -issue_name, -hierarchical_cluster_0.5, 
+                -post_likes_zscore, -post_comments_zscore,
+                -engagement_rate, -engagement_rate_zscore, -likes_by_follower, -comments_by_follower,
+                -likes_by_follower_zscore, -comments_by_follower_zscore,
+                -mean_f0,- std_f0, -VUV, -speaking_rate_w, -MFCC0, -F1, -F2, 
+                -falling_ratio, -rising_ratio, -`rising-falling_ratio`, -`falling-rising_ratio`,
+                -arousal, -valence, -std_arousal, -std_valence) %>%
+  mutate(name = as.factor(name)) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(win = as.factor(win)) %>%
+  mutate(state = as.factor(state)) %>%
+  rename(cluster_va = kmeans_cluster) %>%
+  mutate(keycode = as.factor(keycode)) 
+
+combined2 <- combined1 %>% 
+  dplyr::left_join(audio1, by = "keycode") %>%
+  dplyr::left_join(audio_raw1, by = "keycode") %>%
+  dplyr::left_join(visual1, by = "keycode") %>%
+  dplyr::left_join(text1, by = "keycode") %>%
+  dplyr::left_join(issue1, by = "keycode") %>%
+  dplyr::left_join(populism1, by = c("keycode")) %>%
+  dplyr::inner_join(engagement1, by = c("keycode")) %>%
+  #dplyr::left_join(pop1, by = "keycode") %>%
+  #dplyr::inner_join(objects1, by = "keycode") %>%
+  dplyr::inner_join(poll1, by = c("state", "date", "name", "poll")) %>%
+  #dplyr::inner_join(length1, by = c("state", "date", "name", "party", "keycode")) %>%
+  dplyr::inner_join(sentiment1, by = c("keycode"))
+  
+
+data <- combined2 %>%
+  mutate(cluster_v = ifelse(cluster_v == "0", "Excited", ifelse(cluster_v == "1", "Frowning", 
+                                                         ifelse(cluster_v == "2", "Expressive",
+                                                                ifelse(cluster_v == "3", "Serious", 
+                                                                       ifelse(cluster_v == "4", "Still",
+                                                                              "Cheerful")))))) %>%
+  mutate(cluster_a = ifelse(cluster_a == "0", "Warm", ifelse(cluster_a == "1", "Sharp", 
+                                                         ifelse(cluster_a == "2", "Rapid",
+                                                                ifelse(cluster_a == "3", "Somber", 
+                                                                              "Energetic")))))  %>%
+  mutate(cluster_va = ifelse(cluster_va == "0", "Stony Warm", ifelse(cluster_va == "1", "Concerned Articulate", 
+                                                         ifelse(cluster_va == "2", "Cheerful Energetic",
+                                                                ifelse(cluster_va == "3", "Responsive Rapid",
+                                                                       "Negative Depressed")))))  %>%
+  mutate(cluster_t = ifelse(cluster_t == "0", "authentic", ifelse(cluster_t == "1", "polite",
+                                                         ifelse(cluster_t == "2", "anxious", "combative"))))  %>%
+  mutate(cluster_va = as.factor(cluster_va)) %>%
+  mutate(cluster_v = as.factor(cluster_v)) %>%
+  mutate(cluster_t = as.factor(cluster_t)) %>%
+  mutate(cluster_a = as.factor(cluster_a)) 
+```
+
+```{r}
+liwc <- read_csv("../dataset/labeled_populism_v38_N398 - LIWC Analysis.csv")
+```
+
+#### transposed table of features
+```{r}
+audio_features <- c("mean_f0", "std_f0", "VUV", "speaking_rate_w", "MFCC0", "F1", "F2", 
+                    "falling_ratio", "rising_ratio", "rising-falling_ratio", "falling-rising_ratio",
+                    "arousal", "valence", "std_arousal", "std_valence")
+
+visual_features <- c("AU01_mean", "AU02_mean", "AU04_mean", "AU06_mean", "AU12_mean", 
+                      "AU15_mean", "AU20_mean", "AU25_mean",
+                      "pitch_count_percentage", "roll_count_percentage", "yaw_count_percentage",
+                     "valence_mean", "valence_std", "arousal_mean", "arousal_std")
+
+textual_features <- c("Analytic", "Clout", "Authentic", "affiliation", "achieve", "power", "emo_pos",
+                      "emo_anx", "emo_anger", "emo_sad", "swear", "prosocial", "polite", "conflict",
+                      "we", "they", "moral", "risk", "motion")
+
+data_v <- data %>%
+  dplyr::select(cluster_v, visual_features) %>%
+  group_by(cluster_v) %>%
+  reframe(N = n(), percentage = round((N/398)*100, 2),
+          across(all_of(visual_features), ~ round(mean(.x), 2)))
+
+cols <- c("V1","V2","V3","V4","V5","V6")
+
+transposed_v <- as.data.frame(t(data_v)) %>%
+  mutate(
+    All  = rowSums(across(all_of(cols), ~ as.numeric(.x)), na.rm = TRUE),
+    mean = round(rowMeans(across(all_of(cols), ~ as.numeric(.x)), na.rm = TRUE), 2)
+  ) %>%
+  tibble::rownames_to_column("feature")
+
+ data_a <- data %>%
+  dplyr::select(cluster_a, audio_features) %>%
+  group_by(cluster_a) %>%
+  reframe(N = n(), percentage = round((N/398)*100, 2),
+          across(all_of(audio_features), ~ round(mean(.x), 2)))
+
+cols <- c("V1","V2","V3","V4","V5")
+
+transposed_a <- as.data.frame(t(data_a)) %>%
+  mutate(
+    All  = rowSums(across(all_of(cols), ~ as.numeric(.x)), na.rm = TRUE),
+    mean = round(rowMeans(across(all_of(cols), ~ as.numeric(.x)), na.rm = TRUE), 2)
+  ) %>%
+  tibble::rownames_to_column("feature")
+
+data_t <- data %>%
+  dplyr::select(cluster_t, textual_features) %>%
+  group_by(cluster_t) %>%
+  reframe(N = n(), percentage = round((N/398)*100, 2),
+          across(all_of(textual_features), ~ round(mean(.x, na.rm = TRUE), 2)))
+
+cols <- c("V1","V2","V3","V4")
+
+transposed_t <- as.data.frame(t(data_t)) %>%
+  mutate(
+    All  = rowSums(across(all_of(cols), ~ as.numeric(.x)), na.rm = TRUE),
+    mean = round(rowMeans(across(all_of(cols), ~ as.numeric(.x)), na.rm = TRUE), 2)
+  ) %>%
+  tibble::rownames_to_column("feature")
+
+# write_csv(transposed_a, "audio_features_mean_N398_251002.csv")
+# write_csv(transposed_t, "text_features_mean_N398_251002.csv")
+# write_csv(transposed_v, "visual_features_mean_N398_251002.csv")
+```
+
+
+
+### style and popornot
+#### v + a + t + topic
+```{r}
+data1 <- data %>%
+  #filter(party != "Republican") %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(gender = as.factor(gender)) %>%
+  mutate(popornot = as.factor(popornot)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_t  = as.factor(cluster_t)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(popornot = relevel(popornot, "0")) %>%
+  mutate(topic = relevel(topic, "Voting")) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful")) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic")) %>% 
+  mutate(cluster_t = relevel(cluster_t, "polite"))
+
+model <- glmer(popornot ~ cluster_v + cluster_a + cluster_t + topic + party + gender + (1 | name), 
+               data = data1, family = "binomial")
+summary(model)
+```
+
+#### va + t + topic
+```{r}
+data1 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(gender = as.factor(gender)) %>%
+  mutate(popornot = as.factor(popornot)) %>%
+  mutate(cluster_t  = as.factor(cluster_t)) %>%
+  mutate(cluster_va  = as.factor(cluster_va)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(popornot = relevel(popornot, "0")) %>%
+  mutate(cluster_va = relevel(cluster_va, "Cheerful Energetic")) %>%
+  mutate(topic = relevel(topic, "Voting")) %>%
+  mutate(cluster_t = relevel(cluster_t, "polite"))
+
+model <- glmer(popornot ~ cluster_va + cluster_t + topic + party + gender + (1 | name), 
+               data = data1, family = "binomial")
+summary(model)
+```
+
+#### v + a + va + t
+```{r}
+data1 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(gender = as.factor(gender)) %>%
+  mutate(popornot = as.factor(popornot)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_t  = as.factor(cluster_t)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(cluster_va  = as.factor(cluster_va)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(popornot = relevel(popornot, "0")) %>%
+  mutate(cluster_va = relevel(cluster_va, "Cheerful Energetic")) %>%
+  mutate(topic = relevel(topic, "Voting")) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful")) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic")) %>% 
+  mutate(cluster_t = relevel(cluster_t, "polite"))
+
+model <- glmer(popornot ~ cluster_v + cluster_a + cluster_va + cluster_t + party + gender + (1 | name), 
+               data = data1, family = "binomial")
+summary(model)
+```
+
+#### va + t
+```{r}
+data1 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(gender = as.factor(gender)) %>%
+  mutate(popornot = as.factor(popornot)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_t  = as.factor(cluster_t)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(cluster_va  = as.factor(cluster_va)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(popornot = relevel(popornot, "0")) %>%
+  mutate(cluster_va = relevel(cluster_va, "Cheerful Energetic")) %>%
+  mutate(topic = relevel(topic, "Voting")) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful")) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic")) %>% 
+  mutate(cluster_t = relevel(cluster_t, "polite"))
+
+model <- glmer(popornot ~ cluster_va + cluster_t + party + gender + (1 | name), 
+               data = data1, family = "binomial")
+summary(model)
+```
+
+#### v + a + t
+```{r}
+data1 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(gender = as.factor(gender)) %>%
+  mutate(popornot = as.factor(popornot)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_t  = as.factor(cluster_t)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(cluster_va  = as.factor(cluster_va)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(popornot = relevel(popornot, "0")) %>%
+  mutate(cluster_va = relevel(cluster_va, "Cheerful Energetic")) %>%
+  mutate(topic = relevel(topic, "Voting")) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful")) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic")) %>% 
+  mutate(cluster_t = relevel(cluster_t, "polite"))
+
+model <- glmer(popornot ~ cluster_v + cluster_a + cluster_t + party + gender + (1 | name), 
+               data = data1, family = "binomial")
+summary(model)
+```
+
+### Populism
+
+#### PopBERT
+```{r}
+data %>%
+  group_by(popp, party) %>%
+  count()
+
+tab_style  <- with(data, table(popp, cluster_v))
+chi <- chisq.test(tab_style)
+chi
+chi$stdres
+
+```
+
+##### stat models
+```{r}
+# left
+model <- lmer(left ~ party + (1|name), data = data)
+summary(model)
+#extract_lmer_coefs(model)
+
+# right
+model <- lmer(right ~ party + (1|name), data = data)
+summary(model)
+#extract_lmer_coefs(model)
+
+# centr
+model <- lmer(centr ~ party + (1|name), data = data)
+summary(model)
+#extract_lmer_coefs(model)
+
+# elite
+model <- lmer(elite ~ party + (1|name), data = data)
+summary(model)
+#extract_lmer_coefs(model)
+```
+
+#### LIWC
+```{r}
+liwc_features <- c(
+  "WC", "Analytic", "Clout", "Authentic", "Tone", "WPS", "BigWords", "Dic",
+  "Linguistic", "function", "pronoun", "ppron", "i", "we", "you", "shehe", "they",
+  "ipron", "det", "article", "number", "prep", "auxverb", "adverb", "conj", "negate",
+  "verb", "adj", "quantity", "Drives", "affiliation", "achieve", "power", "Cognition",
+  "allnone", "cogproc", "insight", "cause", "discrep", "tentat", "certitude", "differ",
+  "memory", "Affect", "tone_pos", "tone_neg", "emotion", "emo_pos", "emo_neg", "emo_anx",
+  "emo_anger", "emo_sad", "swear", "Social", "socbehav", "prosocial", "polite", "conflict",
+  "moral", "comm", "socrefs", "family", "friend", "female", "male", "Culture", "politic",
+  "ethnicity", "tech", "Lifestyle", "leisure", "home", "work", "money", "relig", "Physical",
+  "health", "illness", "wellness", "mental", "substances", "sexual", "food", "death", "need",
+  "want", "acquire", "lack", "fulfill", "fatigue", "reward", "risk", "curiosity", "allure",
+  "Perception", "attention", "motion", "space", "visual", "auditory", "feeling", "time",
+  "focuspast", "focuspresent", "focusfuture", "Conversation", "netspeak", "assent", "nonflu",
+  "filler", "AllPunc", "Period", "Comma", "QMark", "Exclam", "Apostro", "OtherP", "Emoji"
+)
+
+names(populism1) <- make.names(names(populism1), unique = TRUE)
+
+# Make sure column names are valid
+liwc_features <- make.names(liwc_features)
+```
+
+
+##### left
+```{r}
+formula <- as.formula(
+  paste("left ~ ", paste(liwc_features, collapse = " + "), "+ name")
+)
+
+model <- lm(formula, data = populism1)
+summary(model)
+```
+
+##### right
+```{r}
+formula <- as.formula(
+  paste("right ~ ", paste(liwc_features, collapse = " + "), "+ name")
+)
+
+model <- lm(formula, data = populism1)
+summary(model)
+```
+
+##### centrm
+```{r}
+# Build the formula
+formula <- as.formula(
+  paste("centr ~ ", paste(liwc_features, collapse = " + "), "+ name")
+)
+
+model <- lm(formula, data = populism1)
+summary(model)
+```
+
+##### elite
+```{r}
+# Build the formula
+formula <- as.formula(
+  paste("elite ~ ", paste(liwc_features, collapse = " + "), "+ name")
+)
+
+model <- lm(formula, data = populism1)
+summary(model)
+```
+
+=================================================================================
+
+### Populism or not
+```{r}
+data %>%
+  group_by(popornot) %>%
+  count()
+```
+
+
+#### Style and populism
+
+##### Visual style
+```{r}
+tab_style  <- with(data, table(popornot, cluster_v))
+chi <- chisq.test(tab_style)
+chi
+chi$stdres
+```
+
+##### audio style
+```{r}
+tab_style  <- with(data, table(popornot, cluster_a))
+chi <- chisq.test(tab_style)
+chi
+chi$stdres
+```
+
+##### text style
+```{r}
+tab_style  <- with(data, table(popornot, cluster_t))
+chi <- chisq.test(tab_style, simulate.p.value = TRUE, B = 1e5)
+chi
+chi$stdres
+```
+
+##### audiovisual style
+```{r}
+tab_style  <- with(data, table(popornot, cluster_va))
+chi <- chisq.test(tab_style)
+chi
+chi$stdres
+```
+
+##### topic
+```{r}
+tab_style  <- with(data, table(popornot, topic))
+chi <- chisq.test(tab_style)
+chi
+chi$stdres
+```
+
+
+
+#### Party, populism, and styles
+#### Republican
+##### Visual style
+```{r}
+data1 <- data %>%
+  filter(party == "Republican") %>%
+  mutate(var = paste(party, popornot))
+
+tab_style  <- with(data1, table(popornot, cluster_v))
+chi <- chisq.test(tab_style, simulate.p.value = TRUE, B = 1e5)
+chi
+chi$stdres
+```
+
+##### audio style
+```{r}
+data1 <- data %>%
+  filter(party == "Republican") %>%
+  mutate(var = paste(party, popornot))
+
+tab_style  <- with(data1, table(popornot, cluster_a))
+chi <- chisq.test(tab_style, simulate.p.value = TRUE, B = 1e5)
+chi
+chi$stdres
+```
+
+##### text style
+```{r}
+data1 <- data %>%
+  filter(party == "Republican") %>%
+  mutate(var = paste(party, popornot))
+
+tab_style  <- with(data1, table(popornot, cluster_t))
+chi <- chisq.test(tab_style, simulate.p.value = TRUE, B = 1e5)
+chi
+chi$stdres
+```
+
+##### audiovisual style
+```{r}
+data1 <- data %>%
+  filter(party == "Republican") %>%
+  mutate(var = paste(party, popornot))
+
+tab_style  <- with(data1, table(popornot, cluster_va))
+chi <- chisq.test(tab_style, simulate.p.value = TRUE, B = 1e5)
+chi
+chi$stdres
+```
+
+##### topic
+```{r}
+data1 <- data %>%
+  filter(party == "Republican") %>%
+  mutate(var = paste(party, popornot))
+
+tab_style  <- with(data1, table(popornot, topic))
+chi <- chisq.test(tab_style, simulate.p.value = TRUE, B = 1e5)
+chi
+chi$stdres
+```
+
+#### Democrats
+##### Visual style
+```{r}
+data1 <- data %>%
+  filter(party != "Republican") %>%
+  mutate(var = paste(party, popornot))
+
+tab_style  <- with(data1, table(popornot, cluster_v))
+chi <- chisq.test(tab_style, simulate.p.value = TRUE, B = 1e5)
+chi
+chi$stdres
+```
+
+##### audio style
+```{r}
+data1 <- data %>%
+  filter(party != "Republican") %>%
+  mutate(var = paste(party, popornot))
+
+tab_style  <- with(data1, table(popornot, cluster_a))
+chi <- chisq.test(tab_style, simulate.p.value = TRUE, B = 1e5)
+chi
+chi$stdres
+```
+
+##### text style
+```{r}
+data1 <- data %>%
+  filter(party != "Republican") %>%
+  mutate(var = paste(party, popornot))
+
+tab_style  <- with(data1, table(popornot, cluster_t))
+chi <- chisq.test(tab_style, simulate.p.value = TRUE, B = 1e5)
+chi
+chi$stdres
+```
+
+##### audiovisual style
+```{r}
+data1 <- data %>%
+  filter(party != "Republican") %>%
+  mutate(var = paste(party, popornot))
+
+tab_style  <- with(data1, table(popornot, cluster_va))
+chi <- chisq.test(tab_style, simulate.p.value = TRUE, B = 1e5)
+chi
+chi$stdres
+```
+
+##### topic
+```{r}
+data1 <- data %>%
+  filter(party != "Republican") %>%
+  mutate(var = paste(party, popornot))
+
+tab_style  <- with(data1, table(popornot, topic))
+chi <- chisq.test(tab_style, simulate.p.value = TRUE, B = 1e5)
+chi
+chi$stdres
+```
+
+#### Party and populism
+```{r}
+tab_style  <- with(data, table(popornot, party))
+chi <- chisq.test(tab_style)
+chi$stdres
+```
+
+#### Party and style
+##### visual
+```{r}
+tab_style  <- with(data, table(cluster_v, party))
+chi <- chisq.test(tab_style)
+chi$stdres
+```
+
+##### audio
+```{r}
+tab_style  <- with(data, table(cluster_a, party))
+chi <- chisq.test(tab_style)
+chi$stdres
+```
+
+##### text
+```{r}
+tab_style  <- with(data, table(cluster_t, party))
+chi <- chisq.test(tab_style, simulate.p.value = TRUE, B = 1e5)
+chi$stdres
+```
+
+##### audiovisual
+```{r}
+tab_style  <- with(data, table(cluster_va, party))
+chi <- chisq.test(tab_style)
+chi$stdres
+```
+
+##### topic
+```{r}
+tab_style  <- with(data, table(topic, party))
+chi <- chisq.test(tab_style)
+chi$stdres
+```
+
+
+#### binary regression
+##### visual
+```{r}
+data1 <- data %>%
+  #filter(party != "Republican") %>%
+  mutate(popornot = as.factor(popornot)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful"))
+
+model <- glmer(popornot ~ cluster_v + gender + party + (1|name), data = data1, family = "binomial")
+#model <- glm(popornot ~ cluster_v+gender + name, data = data1, family = "binomial")
+summary(model)
+```
+##### audio
+```{r}
+data1 <- data %>%
+  #filter(party != "Republican") %>%
+  mutate(popornot = as.factor(popornot)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic"))
+
+model <- glmer(popornot ~ cluster_a + gender + party + (1|name), data = data1, family = "binomial")
+#model <- glm(popornot ~ cluster_a + gender, data = data1, family = "binomial")
+summary(model)
+```
+
+##### audiovisual
+```{r}
+data1 <- data %>%
+  #filter(party != "Republican") %>%
+  mutate(popornot = as.factor(popornot)) %>%
+  mutate(cluster_va  = as.factor(cluster_va)) %>%
+  mutate(cluster_va = relevel(cluster_va, "Cheerful Energetic"))
+
+model <- glmer(popornot ~ cluster_va + gender + party + (1|name), data = data1, family = "binomial")
+summary(model)
+```
+
+##### text
+```{r}
+data1 <- data %>%
+  #filter(party != "Republican") %>%
+  mutate(popornot = as.factor(popornot)) %>%
+  mutate(cluster_t  = as.factor(cluster_t)) %>%
+  mutate(cluster_t = relevel(cluster_t, "polite"))
+
+model <- glmer(popornot ~ cluster_t + gender + party + (1|name), data = data1, family = "binomial")
+summary(model)
+```
+
+##### topic
+```{r}
+data1 <- data %>%
+  #filter(party != "Republican") %>%
+  mutate(popornot = as.factor(popornot)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting"))
+
+model <- glmer(popornot ~ topic + gender + party + (1|name), data = data1, family = "binomial")
+summary(model)
+```
+
+=================================================================================
+### Populism distribution
+```{r}
+data %>%
+  mutate(ideo = ifelse(left_wing == 1 & right_wing == 1, "both",
+                        ifelse(left_wing == 1 & right_wing == 0, "left", 
+                                ifelse(left_wing == 0 & right_wing == 1, "right", "neutral")))) %>%
+  group_by(popp, ideo) %>%
+  count()
+```
+
+
+=================================================================================
+
+### Populism and engagement
+#### likes
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(popornot = as.factor(popornot))
+
+combined3$popornot <- relevel(combined3$popornot, ref = "0")
+
+#model_l <- glmmTMB(post_likes ~ popornot*party*gender + (1 | name), data = combined3, family = nbinom2)
+model_l <- glmmTMB(likes_by_follower ~ popornot*party*gender, data = combined3, family = Gamma(link = "log"))
+summary(model_l)
+```
+
+```{r}
+hist(combined3$likes_by_follower, breaks = 30, main = "Histogram", xlab = "likes_by_follower")
+qqnorm(combined3$likes_by_follower)
+qqline(combined3$likes_by_follower, col = "red")
+```
+
+
+#### comments
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  #filter(comment_count != 0) %>%
+  mutate(popornot = as.factor(popornot))
+
+combined3$popornot <- relevel(combined3$popornot, ref = "0")
+
+#model_l <- glmmTMB(comment_count ~ popornot*party*gender + (1 | name), data = combined3, family = nbinom2)
+model_l <- glmmTMB(comments_by_follower ~ popornot*party*gender, data = combined3, family = tweedie(link = "log"))
+
+summary(model_l)
+```
+
+#### comment sentiments
+##### positive
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(popornot = as.factor(popornot))
+
+combined3$popornot <- relevel(combined3$popornot, ref = "0")
+
+model_l <- lmer(comment_score_pos ~ popornot*party*gender + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+
+##### neutral
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(popornot = as.factor(popornot))
+
+combined3$popornot <- relevel(combined3$popornot, ref = "0")
+
+model_l <- lmer(comment_score_neu ~ popornot*party*gender + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+
+##### negative
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(popornot = as.factor(popornot))
+
+combined3$popornot <- relevel(combined3$popornot, ref = "0")
+
+model_l <- lmer(comment_score_neg ~ popornot*party*gender + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+
+### RQ6 Engagements
+#### likes
+##### All
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  mutate(popornot = as.factor(popornot)) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_t  = as.factor(cluster_t)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting")) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful")) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic")) %>% 
+  mutate(cluster_t = relevel(cluster_t, "polite"))
+
+model_l <- glmmTMB(likes_by_follower ~ cluster_v*popornot
+                   +cluster_a*popornot
+                   +cluster_t*popornot
+                   +topic*popornot
+                   +party+gender, data = combined3, family = Gamma(link = "log"))
+summary(model_l)
+```
+##### Populism = 1
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  filter(popornot == 1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_t  = as.factor(cluster_t)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting")) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful")) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic")) %>% 
+  mutate(cluster_t = relevel(cluster_t, "polite"))
+
+model_l <- glmmTMB(likes_by_follower ~ cluster_v+cluster_a+cluster_t+topic+party+gender, data = combined3, family = Gamma(link = "log"))
+summary(model_l)
+```
+
+##### Populism = 0
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  filter(popornot == 0) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_t  = as.factor(cluster_t)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting")) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful")) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic")) %>% 
+  mutate(cluster_t = relevel(cluster_t, "polite"))
+
+model_l <- glmmTMB(likes_by_follower ~ cluster_v+cluster_a+cluster_t+topic+party+gender, data = combined3, family = Gamma(link = "log"))
+summary(model_l)
+```
+
+
+#### comments
+##### All
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(popornot = as.factor(popornot)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_t  = as.factor(cluster_t)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting")) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful")) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic")) %>% 
+  mutate(cluster_t = relevel(cluster_t, "polite"))
+
+model_l <- glmmTMB(comments_by_follower ~ cluster_v*popornot
+                   +cluster_a*popornot
+                   +cluster_t*popornot
+                   +topic*popornot
+                   +party+gender, data = combined3, family = tweedie(link = "log"))
+summary(model_l)
+```
+
+##### Populism = 1
+```{r}
+combined3 <- data %>%
+  filter(popornot == 1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_t  = as.factor(cluster_t)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting")) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful")) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic")) %>% 
+  mutate(cluster_t = relevel(cluster_t, "polite"))
+
+model_l <- glmmTMB(comments_by_follower ~ cluster_v+cluster_a+cluster_t+topic+party+gender, data = combined3, family = tweedie(link = "log"))
+summary(model_l)
+```
+
+##### Populism = 0
+```{r}
+combined3 <- data %>%
+  filter(popornot == 0) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_t  = as.factor(cluster_t)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting")) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful")) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic")) %>% 
+  mutate(cluster_t = relevel(cluster_t, "polite"))
+
+model_l <- glmmTMB(comments_by_follower ~ cluster_v+cluster_a+cluster_t+topic+party+gender, data = combined3, family = tweedie(link = "log"))
+summary(model_l)
+```
+#### comment sentiments ratio
+```{r}
+# Add smoothing to avoid division by zero
+epsilon <- 1e-6
+
+data$sentiment_ratio <- data$comment_score_pos/ data$comment_score_neg
+#data$sentiment_ratio1 <- (data$comment_score_pos + 1) / (data$comment_score_neg + 1)
+data$sentiment_log_ratio <- log(data$comment_score_pos/ data$comment_score_neg)
+# data$sentiment_log_ratio1 <- log((data$comment_score_pos + 1) / (data$comment_score_neg + 1))
+# data$sentiment_log_ratio_e <- log((data$comment_score_pos + epsilon) / (data$comment_score_neg + epsilon))
+hist(data$sentiment_log_ratio)
+```
+
+##### All
+```{r}
+data1 <- data %>%
+  mutate(popornot = as.factor(popornot)) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_t  = as.factor(cluster_t)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting")) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful")) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic")) %>% 
+  mutate(cluster_t = relevel(cluster_t, "polite"))
+
+# model <- glm(sentiment_ratio1 ~ cluster_v*popornot
+#                    +cluster_a*popornot
+#                    +cluster_t*popornot
+#                    +topic*popornot
+#                    +party+gender, data = data1, family = Gamma(link = "log"))
+# 
+# summary(model)
+
+model <- lmer(sentiment_log_ratio ~ cluster_v*popornot
+                   +cluster_a*popornot
+                   +cluster_t*popornot
+                   +topic*popornot
+                   +party + gender + (1|name), data = data1)
+
+#extract_lmer_coefs(model)
+summary(model)
+```
+
+##### Populism = 1
+```{r}
+data1 <- data %>%
+  filter(popornot == 1) %>%
+  mutate(popornot = as.factor(popornot)) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_t  = as.factor(cluster_t)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting")) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful")) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic")) %>% 
+  mutate(cluster_t = relevel(cluster_t, "polite"))
+
+model <- lmer(sentiment_log_ratio ~ cluster_v
+                   +cluster_a
+                   +cluster_t
+                   +topic
+                   +party + gender + (1|name), data = data1)
+
+summary(model)
+```
+
+##### Populism = 0
+```{r}
+data1 <- data %>%
+  filter(popornot == 0) %>%
+  mutate(popornot = as.factor(popornot)) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_t  = as.factor(cluster_t)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting")) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful")) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic")) %>% 
+  mutate(cluster_t = relevel(cluster_t, "polite"))
+
+model <- lmer(sentiment_log_ratio ~ cluster_v
+                   +cluster_a
+                   +cluster_t
+                   +topic
+                   +party + gender + (1|name), data = data1)
+
+summary(model)
+```
+### RQ7 Engagments (separated models )
+#### likes
+#### populism = 1
+##### visual
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  filter(popornot == 1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful"))
+
+#model_l <- glmmTMB(post_likes ~ cluster_v+party+gender + (1 | name), data = combined3, family = nbinom2)
+model_l <- glmmTMB(likes_by_follower ~ cluster_v+party+gender, data = combined3, family = Gamma(link = "log"))
+summary(model_l)
+```
+
+##### audio
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  filter(popornot == 1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic"))
+
+#model_l <- glmmTMB(post_likes ~ cluster_a+party+gender + (1 | name), data = combined3, family = nbinom2)
+model_l <- glmmTMB(likes_by_follower ~ cluster_a+party+gender, data = combined3, family = Gamma(link = "log"))
+summary(model_l)
+```
+
+##### text
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  filter(popornot == 1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_t  = as.factor(cluster_t)) %>%
+  mutate(cluster_t = relevel(cluster_t, "polite"))
+
+#model_l <- glmmTMB(post_likes ~ cluster_t+party+gender + (1 | name), data = combined3, family = nbinom2)
+model_l <- glmmTMB(likes_by_follower ~ cluster_t+party+gender, data = combined3, family = Gamma(link = "log"))
+summary(model_l)
+```
+
+##### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  filter(popornot == 1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_va  = as.factor(cluster_va)) %>%
+  mutate(cluster_va = relevel(cluster_va, "Cheerful Energetic"))
+
+#model_l <- glmmTMB(post_likes ~ cluster_va+party+gender + (1 | name), data = combined3, family = nbinom2)
+model_l <- glmmTMB(likes_by_follower ~ cluster_va+party+gender, data = combined3, family = Gamma(link = "log"))
+summary(model_l)
+```
+
+##### topic
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  filter(popornot == 1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting"))
+
+#model_l <- glmmTMB(post_likes ~ topic+party+gender + (1 | name), data = combined3, family = nbinom2)
+model_l <- glmmTMB(likes_by_follower ~ topic+party+gender, data = combined3, family = Gamma(link = "log"))
+summary(model_l)
+```
+
+#### populism = 0
+##### visual
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  filter(popornot == 0) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful"))
+
+#model_l <- glmmTMB(post_likes ~ cluster_v+party+gender + (1 | name), data = combined3, family = nbinom2)
+model_l <- glmmTMB(likes_by_follower ~ cluster_v+party+gender, data = combined3, family = Gamma(link = "log"))
+summary(model_l)
+```
+
+##### text
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  filter(popornot == 0) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_t  = as.factor(cluster_t)) %>%
+  mutate(cluster_t = relevel(cluster_t, "polite"))
+
+#model_l <- glmmTMB(post_likes ~ cluster_t+party+gender + (1 | name), data = combined3, family = nbinom2)
+model_l <- glmmTMB(likes_by_follower ~ cluster_t+party+gender, data = combined3, family = Gamma(link = "log"))
+summary(model_l)
+```
+
+##### audio
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  filter(popornot == 0) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic"))
+
+#model_l <- glmmTMB(post_likes ~ cluster_a+party+gender + (1 | name), data = combined3, family = nbinom2)
+model_l <- glmmTMB(likes_by_follower ~ cluster_a+party+gender, data = combined3, family = Gamma(link = "log"))
+summary(model_l)
+```
+
+##### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  filter(popornot == 0) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_va  = as.factor(cluster_va)) %>%
+  mutate(cluster_va = relevel(cluster_va, "Cheerful Energetic"))
+
+#model_l <- glmmTMB(post_likes ~ cluster_va+party+gender + (1 | name), data = combined3, family = nbinom2)
+model_l <- glmmTMB(likes_by_follower ~ cluster_va+party+gender, data = combined3, family = Gamma(link = "log"))
+summary(model_l)
+```
+
+##### topic
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  filter(popornot == 0) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting"))
+
+#model_l <- glmmTMB(post_likes ~ topic+party+gender + (1 | name), data = combined3, family = nbinom2)
+model_l <- glmmTMB(likes_by_follower ~ topic+party+gender, data = combined3, family = Gamma(link = "log"))
+summary(model_l)
+```
+
+#### comments
+
+#### populism = 1
+
+
+##### visual
+```{r}
+combined3 <- data %>%
+  filter(popornot == 1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful"))
+
+#model_l <- glmmTMB(comment_count ~ cluster_v+party+gender + (1 | name), data = combined3, family = nbinom2)
+model_l <- glmmTMB(comments_by_follower ~ cluster_v+party+gender, data = combined3, family = tweedie(link = "log"))
+summary(model_l)
+```
+
+##### audio
+```{r}
+combined3 <- data %>%
+  filter(popornot == 1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic"))
+
+#model_l <- glmmTMB(comment_count ~ cluster_a+party+gender + (1 | name), data = combined3, family = nbinom2)
+model_l <- glmmTMB(comments_by_follower ~ cluster_a+party+gender, data = combined3, family = tweedie(link = "log"))
+summary(model_l)
+```
+##### text
+```{r}
+combined3 <- data %>%
+  filter(popornot == 1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_t  = as.factor(cluster_t)) %>%
+  mutate(cluster_t = relevel(cluster_t, "polite"))
+
+#model_l <- glmmTMB(comment_count ~ cluster_t+party+gender + (1 | name), data = combined3, family = nbinom2)
+model_l <- glmmTMB(comments_by_follower ~ cluster_t+party+gender, data = combined3, family = tweedie(link = "log"))
+summary(model_l)
+```
+
+##### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(popornot == 1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_va  = as.factor(cluster_va)) %>%
+  mutate(cluster_va = relevel(cluster_va, "Cheerful Energetic"))
+
+#model_l <- glmmTMB(comment_count ~ cluster_va+party+gender + (1 | name), data = combined3, family = nbinom2)
+model_l <- glmmTMB(comments_by_follower ~ cluster_va+party+gender, data = combined3, family = tweedie(link = "log"))
+summary(model_l)
+```
+
+##### topic
+```{r}
+combined3 <- data %>%
+  filter(popornot == 1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting"))
+
+#model_l <- glmmTMB(comment_count ~ topic+party+gender + (1 | name), data = combined3, family = nbinom2)
+model_l <- glmmTMB(comments_by_follower ~ topic+party+gender, data = combined3, family = tweedie(link = "log"))
+summary(model_l)
+```
+
+#### populism = 0
+##### visual
+```{r}
+combined3 <- data %>%
+  filter(popornot == 0) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful"))
+
+#model_l <- glmmTMB(comment_count ~ cluster_v+party+gender + (1 | name), data = combined3, family = nbinom2)
+model_l <- glmmTMB(comments_by_follower ~ cluster_v+party+gender, data = combined3, family = tweedie(link = "log"))
+summary(model_l)
+```
+
+##### audio
+```{r}
+combined3 <- data %>%
+  filter(popornot == 0) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic"))
+
+#model_l <- glmmTMB(comment_count ~ cluster_a+party+gender + (1 | name), data = combined3, family = nbinom2)
+model_l <- glmmTMB(comments_by_follower ~ cluster_a+party+gender, data = combined3, family = tweedie(link = "log"))
+summary(model_l)
+```
+
+##### text
+```{r}
+combined3 <- data %>%
+  filter(popornot == 0) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_t  = as.factor(cluster_t)) %>%
+  mutate(cluster_t = relevel(cluster_t, "polite"))
+
+#model_l <- glmmTMB(comment_count ~ cluster_t+party+gender + (1 | name), data = combined3, family = nbinom2)
+model_l <- glmmTMB(comments_by_follower ~ cluster_t+party+gender, data = combined3, family = tweedie(link = "log"))
+summary(model_l)
+```
+
+##### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(popornot == 0) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_va  = as.factor(cluster_va)) %>%
+  mutate(cluster_va = relevel(cluster_va, "Cheerful Energetic"))
+
+#model_l <- glmmTMB(comment_count ~ cluster_va+party+gender + (1 | name), data = combined3, family = nbinom2)
+model_l <- glmmTMB(comments_by_follower ~ cluster_va+party+gender, data = combined3, family = tweedie(link = "log"))
+summary(model_l)
+```
+
+##### topic
+```{r}
+combined3 <- data %>%
+  filter(popornot == 0) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting"))
+
+#model_l <- glmmTMB(comment_count ~ topic+party+gender + (1 | name), data = combined3, family = nbinom2)
+model_l <- glmmTMB(comments_by_follower ~ topic+party+gender, data = combined3, family = tweedie(link = "log"))
+summary(model_l)
+```
+
+#### comment sentiment ratio
+#### populism = 1
+##### visual
+```{r}
+data1 <- data %>%
+  filter(popornot == 1) %>%
+  mutate(popornot = as.factor(popornot)) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_t  = as.factor(cluster_t)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting")) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful")) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic")) %>% 
+  mutate(cluster_t = relevel(cluster_t, "polite"))
+
+model <- lmer(sentiment_log_ratio ~ cluster_v + party + gender + (1|name), data = data1)
+summary(model)
+```
+
+##### audio
+```{r}
+data1 <- data %>%
+  filter(popornot == 1) %>%
+  mutate(popornot = as.factor(popornot)) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_t  = as.factor(cluster_t)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting")) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful")) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic")) %>% 
+  mutate(cluster_t = relevel(cluster_t, "polite"))
+
+model <- lmer(sentiment_log_ratio ~ cluster_a + party + gender + (1|name), data = data1)
+summary(model)
+```
+
+##### text
+```{r}
+data1 <- data %>%
+  filter(popornot == 1) %>%
+  mutate(popornot = as.factor(popornot)) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_t  = as.factor(cluster_t)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting")) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful")) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic")) %>% 
+  mutate(cluster_t = relevel(cluster_t, "polite"))
+
+model <- lmer(sentiment_log_ratio ~ cluster_t + party + gender + (1|name), data = data1)
+summary(model)
+```
+
+##### audiovisual
+```{r}
+data1 <- data %>%
+  filter(popornot == 1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_va  = as.factor(cluster_va)) %>%
+  mutate(cluster_va = relevel(cluster_va, "Cheerful Energetic"))
+
+model <- lmer(sentiment_log_ratio ~ cluster_va + party + gender + (1|name), data = data1)
+summary(model)
+```
+
+##### topic
+```{r}
+data1<- data %>%
+  filter(popornot == 1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting"))
+
+model <- lmer(sentiment_log_ratio ~ topic+ party + gender + (1|name), data = data1)
+summary(model)
+```
+
+#### populism = 0
+##### visual
+```{r}
+data1 <- data %>%
+  filter(popornot == 0) %>%
+  mutate(popornot = as.factor(popornot)) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_t  = as.factor(cluster_t)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting")) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful")) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic")) %>% 
+  mutate(cluster_t = relevel(cluster_t, "polite"))
+
+model <- lmer(sentiment_log_ratio ~ cluster_v + party + gender + (1|name), data = data1)
+summary(model)
+```
+
+##### audio
+```{r}
+data1 <- data %>%
+  filter(popornot == 0) %>%
+  mutate(popornot = as.factor(popornot)) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_t  = as.factor(cluster_t)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting")) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful")) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic")) %>% 
+  mutate(cluster_t = relevel(cluster_t, "polite"))
+
+model <- lmer(sentiment_log_ratio ~ cluster_a + party + gender + (1|name), data = data1)
+summary(model)
+```
+
+##### text
+```{r}
+data1 <- data %>%
+  filter(popornot == 0) %>%
+  mutate(popornot = as.factor(popornot)) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_t  = as.factor(cluster_t)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting")) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful")) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic")) %>% 
+  mutate(cluster_t = relevel(cluster_t, "polite"))
+
+model <- lmer(sentiment_log_ratio ~ cluster_t + party + gender + (1|name), data = data1)
+summary(model)
+```
+
+##### audiovisual
+```{r}
+data1 <- data %>%
+  filter(popornot == 0) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_va  = as.factor(cluster_va)) %>%
+  mutate(cluster_va = relevel(cluster_va, "Cheerful Energetic"))
+
+model <- lmer(sentiment_log_ratio ~ cluster_va + party + gender + (1|name), data = data1)
+summary(model)
+```
+
+##### topic
+```{r}
+data1<- data %>%
+  filter(popornot == 0) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting"))
+
+model <- lmer(sentiment_log_ratio ~ topic + party + gender + (1|name), data = data1)
+summary(model)
+```
+
+##### positive
+#### populism = 1
+##### visual
+```{r}
+combined3 <- data %>%
+  filter(popornot == 1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful"))
+
+model_l <- lmer(comment_score_pos ~ cluster_v+party+gender + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+##### audio
+```{r}
+combined3 <- data %>%
+  filter(popornot == 1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic"))
+
+model_l <- lmer(comment_score_pos ~ cluster_a+party+gender + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+##### text
+```{r}
+combined3 <- data %>%
+  filter(popornot == 1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_t  = as.factor(cluster_t)) %>%
+  mutate(cluster_t = relevel(cluster_t, "polite"))
+
+model_l <- lmer(comment_score_pos ~ cluster_t+party+gender + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+##### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(popornot == 1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_va  = as.factor(cluster_va)) %>%
+  mutate(cluster_va = relevel(cluster_va, "Cheerful Energetic"))
+
+model_l <- lmer(comment_score_pos ~ cluster_va+party+gender + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+##### topic
+```{r}
+combined3 <- data %>%
+  filter(popornot == 1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting"))
+
+model_l <- lmer(comment_score_pos ~ topic+party+gender + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+#### populism = 0
+##### visual
+```{r}
+combined3 <- data %>%
+  filter(popornot == 0) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful"))
+
+model_l <- lmer(comment_score_pos ~ cluster_v+party+gender + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+##### audio
+```{r}
+combined3 <- data %>%
+  filter(popornot == 0) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic"))
+
+model_l <- lmer(comment_score_pos ~ cluster_a+party+gender + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+##### text
+```{r}
+combined3 <- data %>%
+  filter(popornot == 0) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_t  = as.factor(cluster_t)) %>%
+  mutate(cluster_t = relevel(cluster_t, "polite"))
+
+model_l <- lmer(comment_score_pos ~ cluster_t+party+gender + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+##### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(popornot == 0) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_va  = as.factor(cluster_va)) %>%
+  mutate(cluster_va = relevel(cluster_va, "Cheerful Energetic"))
+
+model_l <- lmer(comment_score_pos ~ cluster_va+party+gender + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+##### topic
+```{r}
+combined3 <- data %>%
+  filter(popornot == 0) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting"))
+
+model_l <- lmer(comment_score_pos ~ topic+party+gender + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+##### neutral
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(popornot = as.factor(popornot))
+
+combined3$popornot <- relevel(combined3$popornot, ref = "0")
+
+model_l <- lmer(comment_score_neu ~ popornot*party*gender + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+#### populism = 1
+##### visual
+```{r}
+combined3 <- data %>%
+  filter(popornot == 1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful"))
+
+model_l <- glmmTMB(comment_count ~ cluster_v+party+gender + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+##### audio
+```{r}
+combined3 <- data %>%
+  filter(popornot == 1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic"))
+
+model_l <- glmmTMB(comment_count ~ cluster_a+party+gender + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+##### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(popornot == 1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_va  = as.factor(cluster_va)) %>%
+  mutate(cluster_va = relevel(cluster_va, "Cheerful Energetic"))
+
+model_l <- glmmTMB(comment_count ~ cluster_va+party+gender + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+##### topic
+```{r}
+combined3 <- data %>%
+  filter(popornot == 1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting"))
+
+model_l <- glmmTMB(comment_count ~ topic+party+gender + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+#### populism = 0
+##### visual
+```{r}
+combined3 <- data %>%
+  filter(popornot == 0) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful"))
+
+model_l <- glmmTMB(comment_count ~ cluster_v+party+gender + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+##### audio
+```{r}
+combined3 <- data %>%
+  filter(popornot == 0) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic"))
+
+model_l <- glmmTMB(comment_count ~ cluster_a+party+gender + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+##### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(popornot == 0) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_va  = as.factor(cluster_va)) %>%
+  mutate(cluster_va = relevel(cluster_va, "Cheerful Energetic"))
+
+model_l <- glmmTMB(comment_count ~ cluster_va+party+gender + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+##### topic
+```{r}
+combined3 <- data %>%
+  filter(popornot == 0) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting"))
+
+model_l <- glmmTMB(comment_count ~ topic+party+gender + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+##### negative
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(popornot = as.factor(popornot))
+
+combined3$popornot <- relevel(combined3$popornot, ref = "0")
+
+model_l <- lmer(comment_score_neg ~ popornot*party*gender + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+#### populism = 1
+##### visual
+```{r}
+combined3 <- data %>%
+  filter(popornot == 1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful"))
+
+model_l <- glmmTMB(comment_count ~ cluster_v+party+gender + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+##### audio
+```{r}
+combined3 <- data %>%
+  filter(popornot == 1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic"))
+
+model_l <- glmmTMB(comment_count ~ cluster_a+party+gender + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+##### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(popornot == 1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_va  = as.factor(cluster_va)) %>%
+  mutate(cluster_va = relevel(cluster_va, "Cheerful Energetic"))
+
+model_l <- glmmTMB(comment_count ~ cluster_va+party+gender + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+##### topic
+```{r}
+combined3 <- data %>%
+  filter(popornot == 1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting"))
+
+model_l <- glmmTMB(comment_count ~ topic+party+gender + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+#### populism = 0
+##### visual
+```{r}
+combined3 <- data %>%
+  filter(popornot == 0) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_v  = as.factor(cluster_v)) %>%
+  mutate(cluster_v = relevel(cluster_v, "Cheerful"))
+
+model_l <- glmmTMB(comment_count ~ cluster_v+party+gender + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+##### audio
+```{r}
+combined3 <- data %>%
+  filter(popornot == 0) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_a  = as.factor(cluster_a)) %>%
+  mutate(cluster_a = relevel(cluster_a, "Energetic"))
+
+model_l <- glmmTMB(comment_count ~ cluster_a+party+gender + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+##### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(popornot == 0) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(cluster_va  = as.factor(cluster_va)) %>%
+  mutate(cluster_va = relevel(cluster_va, "Cheerful Energetic"))
+
+model_l <- glmmTMB(comment_count ~ cluster_va+party+gender + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+##### topic
+```{r}
+combined3 <- data %>%
+  filter(popornot == 0) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(topic  = as.factor(topic)) %>%
+  mutate(topic = relevel(topic, "Voting"))
+
+model_l <- glmmTMB(comment_count ~ topic+party+gender + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+=================================================================================
+
+### Populism and style
+
+#### Visual style
+```{r}
+tab_style  <- with(data, table(popp, cluster_v))
+chi <- chisq.test(tab_style, simulate.p.value = TRUE, B = 1e5)
+chi$stdres
+
+#mosaic(tab_style, shade = TRUE, legend = TRUE)
+```
+
+#### audio style
+```{r}
+tab_style  <- with(data, table(popp, cluster_a))
+chi <- chisq.test(tab_style, simulate.p.value = TRUE, B = 1e5)
+chi$stdres
+
+#mosaic(tab_style, shade = TRUE, legend = TRUE)
+```
+
+#### audiovisual style
+```{r}
+tab_style  <- with(data, table(popp, cluster_va))
+chi <- chisq.test(tab_style, simulate.p.value = TRUE, B = 1e5)
+chi$stdres
+
+#mosaic(tab_style, shade = TRUE, legend = TRUE)
+```
+
+#### text
+```{r}
+tab_style  <- with(data, table(popp, cluster_t))
+chi <- chisq.test(tab_style, simulate.p.value = TRUE, B = 1e5)
+chi$stdres
+
+#mosaic(tab_style, shade = TRUE, legend = TRUE)
+```
+
+#### topic
+```{r}
+tab_style  <- with(data, table(popp, topic))
+chi <- chisq.test(tab_style, simulate.p.value = TRUE, B = 1e5)
+chi$stdres
+
+#mosaic(tab_style, shade = TRUE, legend = TRUE)
+```
+
+### Populism and styles in engagement
+#### likes
+##### visual
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(popp = as.factor(popp))
+
+combined3$popp <- relevel(combined3$popp, ref = "none")
+
+model_l <- glmmTMB(post_likes ~ popp*cluster_v + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+
+##### audio
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(popp = as.factor(popp))
+
+combined3$popp <- relevel(combined3$popp, ref = "none")
+
+model_l <- glmmTMB(post_likes ~ popp*cluster_a + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+
+##### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(popp = as.factor(popp))
+
+combined3$popp <- relevel(combined3$popp, ref = "none")
+
+model_l <- glmmTMB(post_likes ~ popp*cluster_va + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+##### topic
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(topic = as.factor(topic)) %>%
+  mutate(popp = as.factor(popp))
+
+combined3$popp <- relevel(combined3$popp, ref = "none")
+combined3$topic <- relevel(combined3$topic, ref = "Candidate Strategies(mix)")
+
+model_l <- glmmTMB(post_likes ~ popp*topic + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+#### comments
+##### visual
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(popp = as.factor(popp))
+
+combined3$popp <- relevel(combined3$popp, ref = "none")
+
+model_l <- glmmTMB(comment_count ~ popp*cluster_v + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+##### audio
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(popp = as.factor(popp))
+
+combined3$popp <- relevel(combined3$popp, ref = "none")
+
+model_l <- glmmTMB(comment_count ~ popp*cluster_a + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+##### audiovisual
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(popp = as.factor(popp))
+
+combined3$popp <- relevel(combined3$popp, ref = "none")
+
+model_l <- glmmTMB(comment_count ~ popp*cluster_va + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+##### topic
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(topic = as.factor(topic)) %>%
+  mutate(popp = as.factor(popp))
+
+combined3$popp <- relevel(combined3$popp, ref = "none")
+combined3$topic <- relevel(combined3$topic, ref = "Candidate Strategies(mix)")
+
+model_l <- glmmTMB(comment_count ~ popp*topic + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+#### comment sentiments
+
+##### positive
+###### visual
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(popp = as.factor(popp))
+
+combined3$popp <- relevel(combined3$popp, ref = "none")
+
+model_l <- lmer(comment_score_pos ~ popp*cluster_v + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+
+###### audio
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(popp = as.factor(popp))
+
+combined3$popp <- relevel(combined3$popp, ref = "none")
+
+model_l <- lmer(comment_score_pos ~ popp*cluster_a + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+###### audiovisual
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(popp = as.factor(popp))
+
+combined3$popp <- relevel(combined3$popp, ref = "none")
+
+model_l <- lmer(comment_score_pos ~ popp*cluster_va + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+###### topic
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(topic = as.factor(topic)) %>%
+  mutate(popp = as.factor(popp))
+
+combined3$popp <- relevel(combined3$popp, ref = "none")
+combined3$topic <- relevel(combined3$topic, ref = "Candidate Strategies(mix)")
+
+model_l <- lmer(comment_score_pos ~ popp*topic + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+##### neutral
+###### visual
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(topic = as.factor(topic)) %>%
+  mutate(popp = as.factor(popp))
+
+combined3$popp <- relevel(combined3$popp, ref = "none")
+
+model_l <- lmer(comment_score_neu ~ popp*cluster_v + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+###### audio
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(topic = as.factor(topic)) %>%
+  mutate(popp = as.factor(popp))
+
+combined3$popp <- relevel(combined3$popp, ref = "none")
+
+model_l <- lmer(comment_score_neu ~ popp*cluster_a + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+###### audiovisual
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(topic = as.factor(topic)) %>%
+  mutate(popp = as.factor(popp))
+
+combined3$popp <- relevel(combined3$popp, ref = "none")
+
+model_l <- lmer(comment_score_neu ~ popp*cluster_va + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+###### topic
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(topic = as.factor(topic)) %>%
+  mutate(popp = as.factor(popp))
+
+combined3$popp <- relevel(combined3$popp, ref = "none")
+combined3$topic <- relevel(combined3$topic, ref = "Candidate Strategies(mix)")
+
+model_l <- lmer(comment_score_neu ~ popp*topic + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+##### negative
+###### visual
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(popp = as.factor(popp))
+
+combined3$popp <- relevel(combined3$popp, ref = "none")
+
+model_l <- lmer(comment_score_neg ~ popp*cluster_v + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+###### audio
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(popp = as.factor(popp))
+
+combined3$popp <- relevel(combined3$popp, ref = "none")
+
+model_l <- lmer(comment_score_neg ~ popp*cluster_a + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+###### audiovisual
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(popp = as.factor(popp))
+
+combined3$popp <- relevel(combined3$popp, ref = "none")
+
+model_l <- lmer(comment_score_neg ~ popp*cluster_va + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+###### topic
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(topic = as.factor(topic)) %>%
+  mutate(popp = as.factor(popp))
+
+combined3$popp <- relevel(combined3$popp, ref = "none")
+combined3$topic <- relevel(combined3$topic, ref = "Candidate Strategies(mix)")
+
+model_l <- lmer(comment_score_neg ~ popp*topic + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+
+=================================================================================
+
+
+### Party and populism
+```{r}
+tab_style  <- with(data, table(popp, party))
+chi <- chisq.test(tab_style)
+chi
+chi$stdres
+```
+
+### Party, populism, and style
+#### visual
+```{r}
+data1 <- data %>%
+  filter(popp %in% c("both", "none")) %>%
+  mutate(parpop = paste(party, popp))
+
+tab_style  <- with(data1, table(parpop, cluster_v))
+chi <- chisq.test(tab_style, simulate.p.value = TRUE, B = 1e5)
+chi$stdres
+```
+
+#### audio
+```{r}
+data1 <- data %>%
+  filter(popp %in% c("both", "none")) %>%
+  mutate(parpop = paste(party, popp))
+
+tab_style  <- with(data1, table(parpop, cluster_a))
+chi <- chisq.test(tab_style, simulate.p.value = TRUE, B = 1e5)
+chi$stdres
+```
+
+#### audiovisual
+```{r}
+data1 <- data %>%
+  filter(popp %in% c("both", "none")) %>%
+  mutate(parpop = paste(party, popp))
+
+tab_style  <- with(data1, table(parpop, cluster_va))
+chi <- chisq.test(tab_style, simulate.p.value = TRUE, B = 1e5)
+chi$stdres
+```
+
+#### topic
+```{r}
+data1 <- data %>%
+  filter(popp %in% c("both", "none")) %>%
+  mutate(parpop = paste(party, popp))
+
+tab_style  <- with(data1, table(parpop, topic))
+chi <- chisq.test(tab_style, simulate.p.value = TRUE, B = 1e5)
+chi$stdres
+```
+
+### Party and populism in Engagement
+#### likes
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(popp = as.factor(popp))
+
+combined3$popp <- relevel(combined3$popp, ref = "none")
+
+model_l <- glmmTMB(post_likes ~ party*popp + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+#### comments
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(popp = as.factor(popp))
+
+combined3$popp <- relevel(combined3$popp, ref = "none")
+
+model_l <- glmmTMB(comment_count ~ party*popp + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+#### comment sentiments
+##### positive
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(popp = as.factor(popp))
+
+combined3$popp <- relevel(combined3$popp, ref = "none")
+
+model_l <- lmer(comment_score_pos ~ popp*party + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+
+##### neutral
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(popp = as.factor(popp))
+
+combined3$popp <- relevel(combined3$popp, ref = "none")
+
+model_l <- lmer(comment_score_neu ~ popp*party + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+
+##### negative
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party)) %>%
+  mutate(popp = as.factor(popp))
+
+combined3$popp <- relevel(combined3$popp, ref = "none")
+
+model_l <- lmer(comment_score_neg ~ popp*party + (1 | name), data = combined3)
+summary(model_l)
+coefs <- extract_lmer_coefs(model_l)
+coefs
+```
+
+
+### visualization
+```{r}
+ft <- ggarrange(t1, t2, t3, t4, nrow = 2, ncol = 2, common.legend = TRUE, legend="bottom")
+annotate_figure(ft, , top = text_grob("Topic", face = "bold", size = 14))
+#ggsave("figure_t.png", dpi = 600, width = 12, height = 8)
+```
+
+
+=================================================================================
+
+### Party and style
+#### visual
+```{r}
+tab_style  <- with(data, table(cluster_v, party))
+chi <- chisq.test(tab_style)
+chi$stdres
+```
+
+#### audio
+```{r}
+tab_style  <- with(data, table(cluster_a, party))
+chi <- chisq.test(tab_style)
+chi$stdres
+```
+
+#### audiovisual
+```{r}
+tab_style  <- with(data, table(cluster_va, party))
+chi <- chisq.test(tab_style)
+chi$stdres
+```
+
+#### topic
+```{r}
+tab_style  <- with(data, table(topic, party))
+chi <- chisq.test(tab_style)
+chi$stdres
+```
+
+### Style x Party in Engagement (Voting)
+### likes
+
+#### visual
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  filter(topic == "Voting") %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(post_likes ~ cluster_v+party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+#### demean ver.
+```{r}
+library(fixest)
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  mutate(party = as.factor(party))
+
+m_nb_fe <- fenegbin(post_likes ~ cluster_v | name,
+                    data = combined3)
+etable(m_nb_fe, se = "cluster", cluster = ~ name)
+```
+
+```{r}
+pred <- ggpredict(model_l, terms = c("cluster_v", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+v1 <- ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted like counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+#ggsave("f_poll_model__visual_N398.png", dpi = 600, width = 8, height = 6)
+```
+
+
+#### audio
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  #filter(topic == "Voting") %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(post_likes ~ cluster_a*party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+#### demean ver.
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  mutate(party = as.factor(party))
+
+m_nb_fe <- fenegbin(post_likes ~ cluster_a | name,
+                    data = combined3)
+etable(m_nb_fe, se = "cluster", cluster = ~ name)
+```
+
+```{r}
+pred <- ggpredict(model_l, terms = c("cluster_a", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted like counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+#### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  #filter(topic == "Voting") %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(post_likes ~ cluster_va + party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+#### demean ver.
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  mutate(party = as.factor(party))
+
+m_nb_fe <- fenegbin(post_likes ~ cluster_va | name,
+                    data = combined3)
+etable(m_nb_fe, se = "cluster", cluster = ~ name)
+```
+
+```{r}
+pred <- ggpredict(model_l, terms = c("cluster_va", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted like counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+#### topic
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(post_likes ~ topic*party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+#### demean ver.
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  mutate(party = as.factor(party))
+
+m_nb_fe <- fenegbin(post_likes ~ topic | name,
+                    data = combined3)
+etable(m_nb_fe, se = "cluster", cluster = ~ name)
+```
+
+```{r}
+pred <- ggpredict(model_l, terms = c("topic", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted like counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+#### Voting va
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  filter(topic == "Voting") %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(post_likes ~ cluster_va + party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+#### demean ver.
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  filter(topic == "Voting") %>%
+  mutate(party = as.factor(party))
+
+m_nb_fe <- fenegbin(post_likes ~ cluster_va | name,
+                    data = combined3)
+etable(m_nb_fe, se = "cluster", cluster = ~ name)
+```
+
+#### v + a + t
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(post_likes ~ cluster_v + cluster_a + topic + party + (1 | name), data = combined3, family = 
+                     nbinom2)
+
+# combined3$cluster_v <- relevel(combined3$cluster_v, ref = "happy")
+# combined3$cluster_a <- relevel(combined3$cluster_a, ref = "happy")
+#combined3$topic <- relevel(combined3$topic, ref = "Voting")
+
+
+summary(model_l)
+```
+
+#### demean ver.
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  mutate(party = as.factor(party))
+
+m_nb_fe <- fenegbin(post_likes ~ cluster_v + cluster_a + topic | name,
+                    data = combined3)
+etable(m_nb_fe, se = "cluster", cluster = ~ name)
+
+check_overdispersion(m_nb_fe)
+```
+
+### comments
+
+#### visual
+```{r}
+combined3 <- data %>%
+  #filter(topic == "Voting") %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(comment_count ~ cluster_v*party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+#### demean ver.
+```{r}
+# combined3 <- data %>%
+#   mutate(party = as.factor(party))
+# 
+# # Poisson FE with candidate fixed effects
+# m_fe_pois <- fepois(comment_count ~ cluster_v | name, data = combined3)
+# 
+# # Clustered SEs (candidate-level)
+# etable(m_fe_pois, se = "cluster", cluster = ~ name)
+# 
+# check_overdispersion(m_fe_pois)
+```
+
+#### demean ver.
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party))
+
+m_nb_fe <- fenegbin(comment_count ~ cluster_v | name,
+                    data = combined3)
+etable(m_nb_fe, se = "cluster", cluster = ~ name)
+```
+
+
+```{r}
+pred <- ggpredict(model_l, terms = c("cluster_v", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted comment counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+#### audio
+```{r}
+combined3 <- data %>%
+  #filter(topic == "Voting") %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(comment_count ~ cluster_a*party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+#### demean ver.
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party))
+
+m_nb_fe <- fenegbin(comment_count ~ cluster_a | name,
+                    data = combined3)
+etable(m_nb_fe, se = "cluster", cluster = ~ name)
+```
+
+```{r}
+pred <- ggpredict(model_l, terms = c("cluster_a", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted comment counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+#### audiovisual
+```{r}
+combined3 <- data %>%
+  #filter(topic == "Voting") %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(comment_count ~ cluster_va+party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+#### demean ver.
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party))
+
+m_nb_fe <- fenegbin(comment_count ~ cluster_va | name,
+                    data = combined3)
+etable(m_nb_fe, se = "cluster", cluster = ~ name)
+```
+
+```{r}
+pred <- ggpredict(model_l, terms = c("cluster_va", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted comment counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+#### topic
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(comment_count ~ topic*party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+#### demean ver.
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party))
+
+m_nb_fe <- fenegbin(comment_count ~ topic | name,
+                    data = combined3)
+etable(m_nb_fe, se = "cluster", cluster = ~ name)
+```
+
+```{r}
+pred <- ggpredict(model_l, terms = c("topic", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted comment counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+#### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(topic == "Voting") %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(comment_count ~ cluster_va+party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+#### demean ver.
+```{r}
+combined3 <- data %>%
+  filter(topic == "Voting") %>%
+  mutate(party = as.factor(party))
+
+m_nb_fe <- fenegbin(comment_count ~ cluster_va | name,
+                    data = combined3)
+etable(m_nb_fe, se = "cluster", cluster = ~ name)
+```
+
+#### v + a + t
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(comment_count ~ cluster_v + cluster_a + topic + party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+#### demean ver.
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party))
+
+m_nb_fe <- fenegbin(comment_count ~ cluster_v + cluster_a + topic | name,
+                    data = combined3)
+etable(m_nb_fe, se = "cluster", cluster = ~ name)
+```
+
+### comment sentiments
+#### positive
+##### visual
+```{r}
+combined3 <- data %>%
+  filter(topic == "Voting") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_pos ~ cluster_v*party + (1|name), data = combined3)
+summary(model)
+coefs <- extract_lmer_coefs(model)
+coefs
+```
+
+```{r}
+pred <- ggpredict(model, terms = c("cluster_v", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+v3 <- ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted comment positivity"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+##### audio
+```{r}
+combined3 <- data %>%
+  filter(topic == "Voting") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_pos ~ cluster_a*party + (1|name), data = combined3)
+coefs <- extract_lmer_coefs(model)
+summary(model)
+coefs
+```
+
+```{r}
+pred <- ggpredict(model, terms = c("cluster_a", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted comment positivity"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+##### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(topic == "Voting") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_pos ~ cluster_va*party + (1|name), data = combined3)
+coefs <- extract_lmer_coefs(model)
+summary(model)
+coefs
+```
+
+```{r}
+pred <- ggpredict(model, terms = c("cluster_va", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted comment positivity"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+#### neutral
+##### visual
+```{r}
+combined3 <- data %>%
+  filter(topic == "Voting") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_neu ~ cluster_v*party + (1|name), data = combined3)
+summary(model)
+coefs <- extract_lmer_coefs(model)
+coefs
+```
+
+##### audio
+```{r}
+combined3 <- data %>%
+  filter(topic == "Voting") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_neu ~ cluster_a*party + (1|name), data = combined3)
+coefs <- extract_lmer_coefs(model)
+summary(model)
+coefs
+```
+
+
+##### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(topic == "Voting") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_neu ~ cluster_va*party + (1|name), data = combined3)
+coefs <- extract_lmer_coefs(model)
+summary(model)
+coefs
+```
+
+
+#### negative
+##### visual
+```{r}
+combined3 <- data %>%
+  filter(topic == "Voting") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_neg ~ cluster_v*party + (1|name), data = combined3)
+summary(model)
+coefs <- extract_lmer_coefs(model)
+coefs
+```
+
+##### audio
+```{r}
+combined3 <- data %>%
+  filter(topic == "Voting") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_neg ~ cluster_a*party + (1|name), data = combined3)
+coefs <- extract_lmer_coefs(model)
+summary(model)
+coefs
+```
+
+
+##### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(topic == "Voting") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_neg ~ cluster_va*party + (1|name), data = combined3)
+coefs <- extract_lmer_coefs(model)
+summary(model)
+coefs
+```
+
+#### topic
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_pos ~ topic*party + (1|name), data = combined3)
+coefs <- extract_lmer_coefs(model)
+coefs
+```
+
+
+```{r}
+pred <- ggpredict(model, terms = c("topic", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted comment positivity"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+### poll
+#### visual
+```{r}
+combined3 <- data %>%
+  filter(topic == "Voting") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(poll_norm ~ cluster_v*party + (1|name), data = combined3)
+coefs <- extract_lmer_coefs(model)
+coefs
+```
+
+```{r}
+pred <- ggpredict(model, terms = c("cluster_v", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+p1 <- ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted poll support"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+#### audio
+```{r}
+combined3 <- data %>%
+  filter(topic == "Voting") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(poll_norm ~ cluster_a*party + (1|name), data = combined3)
+coefs <- extract_lmer_coefs(model)
+coefs
+```
+
+```{r}
+pred <- ggpredict(model, terms = c("cluster_a", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted comment positivity"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+#### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(topic == "Voting") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(poll_norm ~ cluster_va*party + (1|name), data = combined3)
+coefs <- extract_lmer_coefs(model)
+coefs
+```
+
+```{r}
+pred <- ggpredict(model, terms = c("cluster_va", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted comment positivity"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+#### topic
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(poll_norm ~ topic*party + (1|name), data = combined3)
+coefs <- extract_lmer_coefs(model)
+coefs
+```
+
+
+```{r}
+pred <- ggpredict(model, terms = c("topic", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted comment positivity"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+=================================================================================
+### Style x Party (Immigration)
+### likes
+#### visual
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  filter(topic == "Immigration") %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(post_likes ~ cluster_v*party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+```{r}
+pred <- ggpredict(model_l, terms = c("cluster_v", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted like counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+#ggsave("f_poll_model__visual_N398.png", dpi = 600, width = 8, height = 6)
+```
+
+
+#### audio
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  filter(topic == "Immigration") %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(post_likes ~ cluster_a*party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+```{r}
+pred <- ggpredict(model_l, terms = c("cluster_a", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted like counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+#### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  filter(topic == "Immigration") %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(post_likes ~ cluster_va*party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+
+```{r}
+pred <- ggpredict(model_l, terms = c("cluster_va", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted like counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+### comments
+#### visual
+```{r}
+combined3 <- data %>%
+  filter(topic == "Immigration") %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(comment_count ~ cluster_v*party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+```{r}
+pred <- ggpredict(model_l, terms = c("cluster_v", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+v2 <- ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted comment counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+#### audio
+```{r}
+combined3 <- data %>%
+  filter(topic == "Immigration") %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(comment_count ~ cluster_a*party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+
+```{r}
+pred <- ggpredict(model_l, terms = c("cluster_a", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+a2 <- ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted comment counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+#### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(topic == "Immigration") %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(comment_count ~ cluster_va*party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+
+```{r}
+pred <- ggpredict(model_l, terms = c("cluster_va", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+fva2 <- ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted comment counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+#### topic
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(comment_count ~ topic*party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+
+```{r}
+pred <- ggpredict(model_l, terms = c("topic", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted comment counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+### comment sentiments
+#### positive
+##### visual
+```{r}
+combined3 <- data %>%
+  filter(topic == "Immigration") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_pos ~ cluster_v*party + (1|name), data = combined3)
+summary(model)
+coefs <- extract_lmer_coefs(model)
+coefs
+```
+
+##### audio
+```{r}
+combined3 <- data %>%
+  filter(topic == "Immigration") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_pos ~ cluster_a*party + (1|name), data = combined3)
+coefs <- extract_lmer_coefs(model)
+summary(model)
+coefs
+```
+
+##### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(topic == "Immigration") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_pos ~ cluster_va*party + (1|name), data = combined3)
+coefs <- extract_lmer_coefs(model)
+summary(model)
+coefs
+```
+
+
+#### neutral
+##### visual
+```{r}
+combined3 <- data %>%
+  filter(topic == "Immigration") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_neu ~ cluster_v*party + (1|name), data = combined3)
+summary(model)
+coefs <- extract_lmer_coefs(model)
+coefs
+```
+
+##### audio
+```{r}
+combined3 <- data %>%
+  filter(topic == "Immigration") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_neu ~ cluster_a*party + (1|name), data = combined3)
+coefs <- extract_lmer_coefs(model)
+summary(model)
+coefs
+```
+
+##### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(topic == "Immigration") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_neu ~ cluster_va*party + (1|name), data = combined3)
+coefs <- extract_lmer_coefs(model)
+summary(model)
+coefs
+```
+
+### negative
+##### visual
+```{r}
+combined3 <- data %>%
+  filter(topic == "Immigration") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_neg ~ cluster_v*party + (1|name), data = combined3)
+summary(model)
+coefs <- extract_lmer_coefs(model)
+coefs
+```
+
+##### audio
+```{r}
+combined3 <- data %>%
+  filter(topic == "Immigration") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_neg ~ cluster_a*party + (1|name), data = combined3)
+coefs <- extract_lmer_coefs(model)
+summary(model)
+coefs
+```
+
+##### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(topic == "Immigration") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_neg ~ cluster_va*party + (1|name), data = combined3)
+coefs <- extract_lmer_coefs(model)
+summary(model)
+coefs
+```
+
+
+### Style x Party (Abortion)
+### likes
+#### visual
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  filter(topic == "Abortion") %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(post_likes ~ cluster_v*party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+```{r}
+pred <- ggpredict(model_l, terms = c("cluster_v", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+v1 <- ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted like counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+#ggsave("f_poll_model__visual_N398.png", dpi = 600, width = 8, height = 6)
+```
+
+
+#### audio
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  filter(topic == "Abortion") %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(post_likes ~ cluster_a*party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+```{r}
+pred <- ggpredict(model_l, terms = c("cluster_a", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+a1 <- ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted like counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+#### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  filter(topic == "Abortion") %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(post_likes ~ cluster_va*party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+
+```{r}
+pred <- ggpredict(model_l, terms = c("cluster_va", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+fva1 <- ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted like counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+### comments
+#### visual
+```{r}
+combined3 <- data %>%
+  filter(topic == "Abortion") %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(comment_count ~ cluster_v*party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+```{r}
+pred <- ggpredict(model_l, terms = c("cluster_v", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+v2 <- ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted comment counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+#### audio
+```{r}
+combined3 <- data %>%
+  filter(topic == "Abortion") %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(comment_count ~ cluster_a*party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+
+```{r}
+pred <- ggpredict(model_l, terms = c("cluster_a", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+a2 <- ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted comment counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+#### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(topic == "Abortion") %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(comment_count ~ cluster_va*party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+
+```{r}
+pred <- ggpredict(model_l, terms = c("cluster_va", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+fva2 <- ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted comment counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+#### topic
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(comment_count ~ topic*party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+
+```{r}
+pred <- ggpredict(model_l, terms = c("topic", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted comment counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+### comment sentiments
+#### positive
+##### visual
+```{r}
+combined3 <- data %>%
+  filter(topic == "Abortion") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_pos ~ cluster_v*party + (1|name), data = combined3)
+summary(model)
+coefs <- extract_lmer_coefs(model)
+coefs
+```
+
+##### audio
+```{r}
+combined3 <- data %>%
+  filter(topic == "Abortion") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_pos ~ cluster_a*party + (1|name), data = combined3)
+coefs <- extract_lmer_coefs(model)
+summary(model)
+coefs
+```
+
+##### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(topic == "Abortion") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_pos ~ cluster_va*party + (1|name), data = combined3)
+coefs <- extract_lmer_coefs(model)
+summary(model)
+coefs
+```
+
+
+#### neutral
+##### visual
+```{r}
+combined3 <- data %>%
+  filter(topic == "Abortion") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_neu ~ cluster_v*party + (1|name), data = combined3)
+summary(model)
+coefs <- extract_lmer_coefs(model)
+coefs
+```
+
+##### audio
+```{r}
+combined3 <- data %>%
+  filter(topic == "Abortion") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_neu ~ cluster_a*party + (1|name), data = combined3)
+coefs <- extract_lmer_coefs(model)
+summary(model)
+coefs
+```
+
+##### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(topic == "Abortion") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_neu ~ cluster_va*party + (1|name), data = combined3)
+coefs <- extract_lmer_coefs(model)
+summary(model)
+coefs
+```
+
+### negative
+##### visual
+```{r}
+combined3 <- data %>%
+  filter(topic == "Abortion") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_neg ~ cluster_v*party + (1|name), data = combined3)
+summary(model)
+coefs <- extract_lmer_coefs(model)
+coefs
+```
+
+##### audio
+```{r}
+combined3 <- data %>%
+  filter(topic == "Abortion") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_neg ~ cluster_a*party + (1|name), data = combined3)
+coefs <- extract_lmer_coefs(model)
+summary(model)
+coefs
+```
+
+##### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(topic == "Abortion") %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_neg ~ cluster_va*party + (1|name), data = combined3)
+coefs <- extract_lmer_coefs(model)
+summary(model)
+coefs
+```
+
+
+#### topic
+```{r}
+combined3 <- data %>%
+  mutate(party = as.factor(party))
+
+model <- lmer(comment_score_pos ~ topic*party + (1|name), data = combined3)
+coefs <- extract_lmer_coefs(model)
+coefs
+```
+
+
+```{r}
+pred <- ggpredict(model, terms = c("topic", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted comment positivity"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+### Style x Party (Economics)
+### likes
+#### visual
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  filter(topic == "Economic") %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(post_likes ~ cluster_v*party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+```{r}
+pred <- ggpredict(model_l, terms = c("cluster_v", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+v1 <- ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted like counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+#ggsave("f_poll_model__visual_N398.png", dpi = 600, width = 8, height = 6)
+```
+
+
+#### audio
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  filter(topic == "Economic") %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(post_likes ~ cluster_a*party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+```{r}
+pred <- ggpredict(model_l, terms = c("cluster_a", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+a1 <- ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted like counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+#### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(post_likes != -1) %>%
+  filter(topic == "Economic") %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(post_likes ~ cluster_va*party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+
+```{r}
+pred <- ggpredict(model_l, terms = c("cluster_va", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+fva1 <- ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted like counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+### comments
+#### visual
+```{r}
+combined3 <- data %>%
+  filter(topic == "Economic") %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(comment_count ~ cluster_v*party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+```{r}
+pred <- ggpredict(model_l, terms = c("cluster_v", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+v2 <- ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted comment counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+#### audio
+```{r}
+combined3 <- data %>%
+  filter(topic == "Economic") %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(comment_count ~ cluster_a*party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+
+```{r}
+pred <- ggpredict(model_l, terms = c("cluster_a", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+a2 <- ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted comment counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+#### audiovisual
+```{r}
+combined3 <- data %>%
+  filter(topic == "Economic") %>%
+  mutate(party = as.factor(party))
+
+model_l <- glmmTMB(comment_count ~ cluster_va*party + (1 | name), data = combined3, family = nbinom2)
+summary(model_l)
+```
+
+
+```{r}
+pred <- ggpredict(model_l, terms = c("cluster_va", "party")) %>%
+  as.data.frame() %>%
+  mutate(party = group)
+
+x_levels <- pred %>%
+  filter(party == "Republican") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred <- pred %>%
+  mutate(x = factor(x, levels = x_levels))
+
+# Plot
+fva2 <- ggplot(pred, aes(x = x, y = predicted, fill = party)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = predicted, ymax = conf.high),
+                position = position_dodge(width = 0.7), width = 0.3) +
+  scale_fill_manual(values = c("Republican" = "#f8766d", "Democratic" = "#729fed")) +
+  labs(
+    x = "",
+    y = "Predicted comment counts"
+  ) +
+  coord_flip()+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(margin = margin(b = 10), size = 12),
+    panel.grid.major.y = element_line(color = "#ecf0f1"),
+    plot.margin = margin(1, 1, 1, 1, "cm"),
+    axis.text.x = element_text(size = 12),
+    strip.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+### visualization
+```{r}
+fv <- ggarrange(v1, v2, nrow = 2, common.legend = TRUE, legend="bottom")
+annotate_figure(fv, , top = text_grob("Visual", face = "bold", size = 14))
+#ggsave("figure_v.png", dpi = 600, width = 6, height = 8)
+```
+
+```{r}
+f1 <- ggarrange(a1, a2, nrow = 2, common.legend = TRUE, legend="bottom") 
+annotate_figure(f1, , top = text_grob("Audio", face = "bold", size = 14))
+#ggsave("figure_a.png", dpi = 600, width = 6, height = 8)
+```
+
+```{r}
+fva <- ggarrange(fva1, fva2, nrow = 2, common.legend = TRUE, legend="bottom")
+annotate_figure(fva , top = text_grob("Audiovisual", face = "bold", size = 14))
+ggsave("figure_va.png", dpi = 600, width = 6, height = 8)
+```
