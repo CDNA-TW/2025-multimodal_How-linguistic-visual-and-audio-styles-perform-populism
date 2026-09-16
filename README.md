@@ -2,7 +2,7 @@
 
 Code and data for the study *"How Linguistic, Visual, and Audio Styles Perform Populism: A Multimodal, Computational Analysis of Campaign Videos on Instagram."* This repository contains the full processing pipeline — from Instagram data collection through audio/visual/text feature extraction, populism classification, clustering, and the final statistical models — plus the analysis-ready datasets.
 
-> **Citation**: *TODO — fill in the full citation (authors, year, journal, DOI) once the paper is accepted/published.*
+
 
 ## Getting the code
 
